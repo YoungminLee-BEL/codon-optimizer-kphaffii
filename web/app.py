@@ -32,11 +32,12 @@ def optimize_endpoint():
 
         input_type = data.get('input_type', 'auto')
         selected_enzymes = data.get('selected_enzymes', [])
-        options = data.get('options', {
-            'avoid_rare_codons': True,
-            'check_hairpin': True,
-            'check_repeats': True,
-        })
+        # All manufacturability checks are always enforced.
+        # Only avoid_rare_codons is user-configurable.
+        user_opts = data.get('options', {})
+        options = {
+            'avoid_rare_codons': user_opts.get('avoid_rare_codons', True),
+        }
 
         result = optimize(
             raw_input=sequence,

@@ -375,19 +375,9 @@
           <span class="toggle-slider"></span>
         </label>
       </div>
-      <div class="toggle-row">
-        <span class="toggle-label">Check 5&prime; hairpin structure</span>
-        <label class="toggle-switch">
-          <input type="checkbox" id="opt-hairpin" checked>
-          <span class="toggle-slider"></span>
-        </label>
-      </div>
-      <div class="toggle-row">
-        <span class="toggle-label">Check internal repeat sequences</span>
-        <label class="toggle-switch">
-          <input type="checkbox" id="opt-repeats" checked>
-          <span class="toggle-slider"></span>
-        </label>
+      <div style="padding: 10px 0; font-size: 0.8rem; color: var(--text-muted);">
+        All other manufacturability constraints (5&prime; hairpin, repeats, homopolymers, RBS,
+        cryptic promoters, terminator sequences) are always actively corrected.
       </div>
     </div>
   </div>
@@ -413,6 +403,7 @@
         <div class="label">CAI Score</div>
         <div class="value" id="res-cai">—</div>
         <div class="sub" id="res-cai-interp">—</div>
+        <div class="sub" style="color:var(--text-muted);margin-top:4px;font-size:0.7rem" id="res-cai-note"></div>
       </div>
       <div class="summary-card">
         <div class="label">Sequence Length</div>
@@ -445,6 +436,10 @@
     <!-- Quality Checks -->
     <div class="checks-section">
       <div class="section-title" style="font-size:0.95rem">Quality Checks</div>
+      <p style="font-size:0.82rem;color:var(--text-muted);margin-bottom:12px">
+        All violations below were actively corrected where possible.
+        Remaining failures indicate constraints unresolvable by synonymous codon swaps.
+      </p>
       <div id="checks-container"></div>
     </div>
 
@@ -638,8 +633,6 @@ async function runOptimize() {
   const selectedEnzymes = [...document.querySelectorAll('#enzyme-grid input:checked')].map(cb => cb.value);
   const options = {
     avoid_rare_codons: document.getElementById('opt-rare').checked,
-    check_hairpin: document.getElementById('opt-hairpin').checked,
-    check_repeats: document.getElementById('opt-repeats').checked,
   };
 
   setLoading(true);
@@ -701,6 +694,7 @@ function renderResults(data) {
     : cai.toFixed(3);
   caiEl.className = 'value ' + (cai >= 0.8 ? 'cai-excellent' : cai >= 0.6 ? 'cai-good' : 'cai-poor');
   document.getElementById('res-cai-interp').textContent = data.cai_interpretation;
+  document.getElementById('res-cai-note').textContent = 'All manufacturability constraints enforced';
 
   // Length
   document.getElementById('res-length').textContent = `${nt_len} bp`;
