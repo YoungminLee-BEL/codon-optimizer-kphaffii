@@ -300,17 +300,31 @@ def _stem_dg(stem_seq: str, complement_seq: str) -> float:
     return dg
 
 
-def fiveprime_hairpin(sequence: str) -> dict:
+def _find_worst_hairpin(sequence: str, max_region: int = 60) -> dict | None:
     """
-    Check the first 48 bp for hairpin structures using a pure-Python stem-loop detector.
-    Note: ΔG estimated with simplified nearest-neighbor model. For precise values, use ViennaRNA.
+    Scan up to max_region bp for the worst (lowest ΔG) hairpin structure.
+
+    Returns a dict with full structural information, or None if no hairpin
+    with ΔG < 0 is found.
+
+    Returned dict keys:
+        dg          : float  — estimated ΔG (kcal/mol)
+        stem5_start : int    — 0-based DNA start of 5' stem arm
+        stem5_end   : int    — exclusive end of 5' stem arm
+        stem3_start : int    — 0-based DNA start of 3' stem arm
+        stem3_end   : int    — exclusive end of 3' stem arm
+        stem5_seq   : str    — RNA sequence of 5' arm
+        stem3_seq   : str    — RNA sequence of 3' arm (5'→3')
+        loop_seq    : str    — RNA loop sequence
+        stem_len    : int
+        loop_len    : int
+        structure   : str    — human-readable description
     """
-    region = _dna_to_rna(sequence[:48])
+    region = _dna_to_rna(sequence[:max_region])
     n = len(region)
 
+    best: dict | None = None
     best_dg = 0.0
-    best_structure = None
-    threshold_dg = -8.0
 
     for stem_len in range(4, 16):
         for loop_len in range(3, 11):
@@ -320,7 +334,6 @@ def fiveprime_hairpin(sequence: str) -> dict:
                 if j + stem_len > n:
                     break
                 stem3 = region[j:j + stem_len]
-                # Check Watson-Crick complementarity for all base pairs
                 complement = stem3[::-1]
                 valid = all(_is_complement(stem5[k], complement[k]) for k in range(stem_len))
                 if not valid:
@@ -329,11 +342,35 @@ def fiveprime_hairpin(sequence: str) -> dict:
                 if dg < best_dg:
                     best_dg = dg
                     loop = region[i + stem_len:j]
-                    best_structure = (
-                        f"Stem: {stem5} / {stem3[::-1]} "
-                        f"(len={stem_len}), Loop: {loop} "
-                        f"(len={loop_len}), ΔG≈{dg:.1f} kcal/mol"
-                    )
+                    best = {
+                        'dg': dg,
+                        'stem5_start': i,
+                        'stem5_end': i + stem_len,
+                        'stem3_start': j,
+                        'stem3_end': j + stem_len,
+                        'stem5_seq': stem5,
+                        'stem3_seq': stem3,
+                        'loop_seq': loop,
+                        'stem_len': stem_len,
+                        'loop_len': loop_len,
+                        'structure': (
+                            f"Stem: {stem5} / {stem3[::-1]} "
+                            f"(len={stem_len}), Loop: {loop} "
+                            f"(len={loop_len}), ΔG≈{dg:.1f} kcal/mol"
+                        ),
+                    }
+    return best
+
+
+def fiveprime_hairpin(sequence: str) -> dict:
+    """
+    Check the first 48 bp for hairpin structures using a pure-Python stem-loop detector.
+    Note: ΔG estimated with simplified nearest-neighbor model. For precise values, use ViennaRNA.
+    """
+    threshold_dg = -8.0
+    best = _find_worst_hairpin(sequence, max_region=48)
+    best_dg = best['dg'] if best else 0.0
+    best_structure = best['structure'] if best else None
 
     passed = best_dg >= threshold_dg
     if best_structure:
