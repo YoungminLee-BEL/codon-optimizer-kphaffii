@@ -184,7 +184,7 @@
   .toggle-switch input:checked + .toggle-slider::before { transform: translateX(16px); }
 
   /* Optimize button */
-  .optimize-section { margin-top: 24px; }
+  .optimize-section { margin-top: 24px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   .spinner {
     display: none;
     width: 18px; height: 18px;
@@ -194,6 +194,30 @@
     animation: spin 0.7s linear infinite;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+  .btn-cancel {
+    display: none;
+    padding: 10px 20px;
+    background: #dc3545;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  .btn-cancel:hover { background: #b02a37; }
+  .cancelled-banner {
+    display: none;
+    margin-top: 12px;
+    padding: 10px 14px;
+    background: #fff3cd;
+    border: 1px solid #ffc107;
+    border-radius: 6px;
+    color: #664d03;
+    font-size: 14px;
+    font-weight: 500;
+  }
 
   /* Results */
   #results { display: none; margin-top: 32px; }
@@ -389,8 +413,12 @@
       <span id="btn-text">Optimize Sequence</span>
       <div class="spinner" id="spinner"></div>
     </button>
-    <div class="error-box" id="error-box"></div>
+    <button class="btn-cancel" id="cancel-btn" onclick="runCancel()">&#10005; Cancel</button>
   </div>
+  <div class="cancelled-banner" id="cancelled-banner">
+    &#9888; Optimization cancelled — partial results shown below.
+  </div>
+  <div class="error-box" id="error-box"></div>
 
   <!-- Results -->
   <div id="results">
@@ -638,6 +666,7 @@ async function runOptimize() {
   setLoading(true);
   document.getElementById('error-box').style.display = 'none';
   document.getElementById('results').style.display = 'none';
+  document.getElementById('cancelled-banner').style.display = 'none';
 
   try {
     const resp = await fetch('/optimize', {
@@ -650,6 +679,9 @@ async function runOptimize() {
       showError(data.error || 'Unknown error.');
     } else {
       lastResult = data;
+      if (data.cancelled) {
+        document.getElementById('cancelled-banner').style.display = 'block';
+      }
       renderResults(data);
     }
   } catch (e) {
@@ -659,12 +691,20 @@ async function runOptimize() {
   }
 }
 
+async function runCancel() {
+  try {
+    await fetch('/cancel', {method: 'POST'});
+  } catch (e) { /* ignore */ }
+}
+
 function setLoading(state) {
   const btn = document.getElementById('optimize-btn');
+  const cancelBtn = document.getElementById('cancel-btn');
   const spinner = document.getElementById('spinner');
   const btnText = document.getElementById('btn-text');
   const btnIcon = document.getElementById('btn-icon');
   btn.disabled = state;
+  cancelBtn.style.display = state ? 'inline-block' : 'none';
   spinner.style.display = state ? 'block' : 'none';
   btnIcon.style.display = state ? 'none' : 'inline';
   btnText.textContent = state ? 'Optimizing...' : 'Optimize Sequence';

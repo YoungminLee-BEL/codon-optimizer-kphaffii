@@ -9,6 +9,7 @@ Pipeline:
 """
 
 import re
+import time
 from typing import Optional
 
 from .codon_table import (
@@ -29,6 +30,10 @@ from .checkers import (
     _reverse_complement,
 )
 from .cai import calculate_cai
+
+
+def _log_timer(name: str, elapsed: float) -> None:
+    print(f"[TIMER] {name}: {elapsed:.3f}s", flush=True)
 
 # ---------------------------------------------------------------------------
 # Input parsing / validation
@@ -625,21 +630,20 @@ def fix_homopolymer_runs(
 # Fixer: repeat sequences > 20 bp
 # ---------------------------------------------------------------------------
 
-def _find_repeats(seq: str, min_len: int = 21) -> list[tuple[int, int]]:
-    """Return (start, end) of second (and later) occurrences of repeated substrings."""
+def _find_repeats(seq: str, min_len: int = 21, max_len: int = 50) -> list[tuple[int, int]]:
+    """Return (start, end) of second (and later) occurrences of repeated substrings.
+    Capped at max_len to avoid O(n²) blow-up on long sequences."""
     n = len(seq)
-    second_occurrences = []
-    seen: dict[str, int] = {}
-    for length in range(min_len, n // 2 + 1):
+    second_set: set[int] = set()
+    for length in range(min_len, min(max_len + 1, n // 2 + 1)):
+        seen: dict[str, int] = {}
         for i in range(n - length + 1):
             s = seq[i:i + length]
             if s in seen:
-                # This is a second+ occurrence — record it for fixing
-                if i not in [x for x, _ in second_occurrences]:
-                    second_occurrences.append((i, i + length))
+                second_set.add(i)
             else:
                 seen[s] = i
-    return second_occurrences
+    return [(i, i + min_len) for i in sorted(second_set)]
 
 
 def fix_repeat_sequences(
@@ -648,62 +652,62 @@ def fix_repeat_sequences(
     changes: list[dict],
 ) -> tuple[list[str], list[str]]:
     """
-    Break repeated subsequences > 20 bp by introducing synonymous codon diversity
-    in the second (or later) occurrence.
+    Break repeated subsequences (21–50 bp) by introducing synonymous codon diversity.
+    Capped at 20 total swap attempts to keep runtime bounded.
     Returns (new_codons, list_of_unresolved_warnings).
     """
     unresolved = []
     n = len(codons)
     reason = "fix: repeat_sequences"
+    MAX_SWAPS = 20
+    swaps_done = 0
 
-    for outer in range(10):
+    for _outer in range(10):
+        if swaps_done >= MAX_SWAPS:
+            break
         seq = _codons_to_seq(codons)
         repeats = _find_repeats(seq)
         if not repeats:
             break
 
-        fixed_any = False
+        made_progress = False
         for start, end in repeats:
+            if swaps_done >= MAX_SWAPS:
+                break
             indices = _overlapping_codon_indices(start, end - start, n)
             indices = [i for i in indices if i > 0]
             if not indices:
                 continue
 
-            # For repeats, prefer second-best codon (introduce diversity)
-            # Try each overlapping codon, swapping to second-best first
-            made_progress = False
             for idx in indices:
-                alts = _synonyms_by_freq(codons[idx])
-                for alt in alts:
+                if swaps_done >= MAX_SWAPS:
+                    break
+                for alt in _synonyms_by_freq(codons[idx]):
                     test = codons[:]
                     test[idx] = alt
-                    if chk_repeat(_codons_to_seq(test))['passed']:
+                    test_seq = _codons_to_seq(test)
+                    new_repeats = _find_repeats(test_seq)
+                    if len(new_repeats) < len(repeats) or chk_repeat(test_seq)['passed']:
                         _record_change(changes, idx, alt, reason)
                         codons = test
+                        swaps_done += 1
                         made_progress = True
-                        fixed_any = True
-                        break
-                    # Even if check doesn't fully pass, accept if repeat shrunk
-                    new_repeats = _find_repeats(_codons_to_seq(test))
-                    if len(new_repeats) < len(repeats):
-                        _record_change(changes, idx, alt, reason)
-                        codons = test
-                        made_progress = True
-                        fixed_any = True
                         break
                 if made_progress:
                     break
+            if made_progress:
+                break
 
-        if not fixed_any:
-            seq = _codons_to_seq(codons)
-            still = _find_repeats(seq)
-            for s, e in still:
-                unresolved.append(
-                    f"repeat_sequences: repeated region at position {s}-{e} "
-                    "could not be broken by synonymous swaps"
-                )
+        if not made_progress:
             break
 
+    seq = _codons_to_seq(codons)
+    still = _find_repeats(seq)
+    for s, e in still:
+        unresolved.append(
+            f"repeat_sequences: repeated region at position {s}-{e} "
+            "could not be broken within swap limit"
+        )
     return codons, unresolved
 
 
@@ -830,9 +834,11 @@ def optimize(
     input_type: str = 'auto',
     selected_enzymes: Optional[list[str]] = None,
     options: Optional[dict] = None,
+    cancel_event=None,
 ) -> dict:
     """
     Full codon optimization pipeline.
+    cancel_event: optional threading.Event — if set, remaining fixers are skipped.
     """
     if options is None:
         options = {'avoid_rare_codons': True}
@@ -843,8 +849,12 @@ def optimize(
     if invalid_enzymes:
         raise ValueError(f"Unknown restriction enzymes: {', '.join(invalid_enzymes)}")
 
+    cancelled = False
+
     # 1. Parse input
+    t0 = time.perf_counter()
     protein, detected_type, original_nt = parse_input(raw_input, input_type)
+    _log_timer("parse_input", time.perf_counter() - t0)
 
     # CAI of original DNA input
     cai_original = None
@@ -855,7 +865,10 @@ def optimize(
             pass
 
     # 2. Greedy build
+    t0 = time.perf_counter()
     all_codons, changes = _build_greedy_sequence(protein)
+    _log_timer("greedy_build", time.perf_counter() - t0)
+
     # Separate coding codons from stop
     stop_codon = all_codons[-1]
     codons = all_codons[:-1]  # working list, no stop
@@ -865,6 +878,7 @@ def optimize(
     failed_sites: list[dict] = []
 
     if selected_enzymes:
+        t0 = time.perf_counter()
         cds = _codons_to_seq(codons)
         cds_cleaned, removed_sites, failed_sites = remove_sites(cds, selected_enzymes, CODON_USAGE)
         codons = [cds_cleaned[i:i+3] for i in range(0, len(cds_cleaned) - 2, 3)]
@@ -873,6 +887,7 @@ def optimize(
             if idx < len(changes):
                 changes[idx]['optimized'] = removal['new_codon']
                 changes[idx]['reason'] = f"restriction site removal: {removal['enzyme']}"
+        _log_timer("restriction_site_removal", time.perf_counter() - t0)
 
     # 4. Actively fix ALL violations — iterate up to 5 full fixer passes
     all_unresolved: list[str] = []
@@ -886,19 +901,28 @@ def optimize(
             break
 
         for fixer_fn, options_key, violation_name in _FIXERS:
+            # Check for cancellation before each fixer
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                break
+
             # Skip rare_codons fixer if option is off
             if options_key and not options.get(options_key, True):
                 continue
 
+            t0 = time.perf_counter()
             codons, unresolved = fixer_fn(codons, protein, changes)
+            _log_timer(f"fixer:{fixer_fn.__name__}(pass={full_pass})", time.perf_counter() - t0)
+
             # Unresolved warnings are de-duplicated and kept for the last pass only
             if full_pass == 4:  # only report from final pass
                 all_unresolved.extend(unresolved)
 
+        if cancelled:
+            break
+
         seq_after = _codons_to_seq(codons) + stop_codon
-        check_results_after = run_all_checks(
-            seq_after, {'check_repeats': True}
-        )
+        check_results_after = run_all_checks(seq_after, {'check_repeats': True})
         violations_after = {c['name'] for c in check_results_after if not c['passed']}
 
         if violations_after == violations_before:
@@ -920,6 +944,7 @@ def optimize(
             deduped_unresolved.append(w)
 
     # 5. Final CDS
+    t0 = time.perf_counter()
     final_cds = _codons_to_seq(codons) + stop_codon
 
     # 6. Final CAI
@@ -927,6 +952,7 @@ def optimize(
 
     # 7. Final checks (always run all checks for reporting)
     check_results = run_all_checks(final_cds, {'check_repeats': True})
+    _log_timer("final_validation", time.perf_counter() - t0)
 
     # 8. Codon changes report (only actual changes vs greedy original)
     codon_changes = []
@@ -944,6 +970,8 @@ def optimize(
 
     # 9. Warnings: remaining check failures + unresolved fixer issues
     warnings: list[str] = []
+    if cancelled:
+        warnings.append("Optimization cancelled — some fixers were skipped; results may be incomplete.")
     for check in check_results:
         if not check['passed']:
             warnings.append(f"{check['name']}: {check['details']}")
@@ -979,4 +1007,5 @@ def optimize(
         'restriction_sites_failed': failed_sites,
         'codon_changes': codon_changes,
         'warnings': warnings,
+        'cancelled': cancelled,
     }

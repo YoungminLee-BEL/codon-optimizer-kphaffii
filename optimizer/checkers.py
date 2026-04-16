@@ -157,27 +157,26 @@ def terminator_sequences(sequence: str) -> dict:
 def repeat_sequences(sequence: str) -> dict:
     seq = sequence.upper()
     n = len(seq)
-    positions = []
-    min_repeat = 20
+    min_repeat = 21
+    max_repeat = 50  # cap to keep O(n) per length, avoid O(n²) blow-up
+    found: set[int] = set()
 
-    seen = {}
-    for length in range(min_repeat, n // 2 + 1):
+    for length in range(min_repeat, min(max_repeat + 1, n // 2 + 1)):
+        seen: dict[str, int] = {}
         for i in range(n - length + 1):
             subseq = seq[i:i + length]
             if subseq in seen:
-                first_pos = seen[subseq]
-                if i not in positions:
-                    positions.append(first_pos)
-                    positions.append(i)
+                found.add(seen[subseq])
+                found.add(i)
             else:
                 seen[subseq] = i
 
-    positions = sorted(set(positions))
+    positions = sorted(found)
     passed = len(positions) == 0
     details = (
-        "No repeated subsequences > 20 bp found"
+        "No repeated subsequences (21–50 bp) found"
         if passed
-        else f"Repeated sequences (>20 bp) at positions: {positions[:10]}"
+        else f"Repeated sequences (21–50 bp) at positions: {positions[:10]}"
               + (" ..." if len(positions) > 10 else "")
     )
     return {"name": "repeat_sequences", "passed": passed, "details": details,
