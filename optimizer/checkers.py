@@ -260,135 +260,67 @@ def rare_codons(sequence: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 5' Hairpin — pure-Python nearest-neighbor ΔG estimation
+# 5' Structure — fast heuristic (GC% + inverted repeat detection, no ΔG)
 # ---------------------------------------------------------------------------
 
-# Simplified RNA Turner 1999 nearest-neighbor stacking energies (kcal/mol)
-# Key: 5'XY3' / 3'X'Y'5' → stacking energy
-# Format: "XY" where X and Y are 5'→3' on the sense strand, complement implicit
-_RNA_NN_DG: dict[str, float] = {
-    'AA': -0.9, 'AU': -0.9, 'UA': -1.1, 'UU': -0.9,
-    'GA': -1.3, 'GU': -2.1, 'CA': -1.8, 'CU': -1.7,
-    'AG': -1.3, 'UG': -2.1, 'AC': -1.8, 'UC': -1.7,
-    'GG': -3.4, 'GC': -2.9, 'CG': -3.4, 'CC': -3.3,
-}
-
-_WC_PAIRS = {('A', 'U'), ('U', 'A'), ('G', 'C'), ('C', 'G'), ('G', 'U'), ('U', 'G')}
+_RC_MAP = {'A': 'T', 'T': 'A', 'G': 'C', 'C': 'G', 'N': 'N'}
 
 
-def _dna_to_rna(seq: str) -> str:
-    return seq.upper().replace('T', 'U')
-
-
-def _is_complement(a: str, b: str) -> bool:
-    return (a, b) in _WC_PAIRS
-
-
-def _stem_dg(stem_seq: str, complement_seq: str) -> float:
-    """Estimate stacking ΔG for a stem using nearest-neighbor model."""
-    dg = 0.0
-    n = len(stem_seq)
-    for i in range(n - 1):
-        pair = stem_seq[i] + stem_seq[i + 1]
-        dg += _RNA_NN_DG.get(pair, -1.0)
-    # Initiation penalty
-    first_pair = (stem_seq[0], complement_seq[-1])
-    last_pair = (stem_seq[-1], complement_seq[0])
-    for pair in [first_pair, last_pair]:
-        if pair[0] in 'AU' or pair[1] in 'AU':
-            dg += 0.45  # AU-end penalty
-    return dg
-
-
-def _find_worst_hairpin(sequence: str, max_region: int = 60) -> dict | None:
+def _has_inverted_repeat(
+    seq: str, min_arm: int = 8, min_loop: int = 3, max_loop: int = 10
+) -> tuple[bool, str]:
     """
-    Scan up to max_region bp for the worst (lowest ΔG) hairpin structure.
-
-    Returns a dict with full structural information, or None if no hairpin
-    with ΔG < 0 is found.
-
-    Returned dict keys:
-        dg          : float  — estimated ΔG (kcal/mol)
-        stem5_start : int    — 0-based DNA start of 5' stem arm
-        stem5_end   : int    — exclusive end of 5' stem arm
-        stem3_start : int    — 0-based DNA start of 3' stem arm
-        stem3_end   : int    — exclusive end of 3' stem arm
-        stem5_seq   : str    — RNA sequence of 5' arm
-        stem3_seq   : str    — RNA sequence of 3' arm (5'→3')
-        loop_seq    : str    — RNA loop sequence
-        stem_len    : int
-        loop_len    : int
-        structure   : str    — human-readable description
+    Scan for a perfect inverted repeat (potential stem-loop) in seq.
+    Returns (found, description_string).
     """
-    region = _dna_to_rna(sequence[:max_region])
-    n = len(region)
-
-    best: dict | None = None
-    best_dg = 0.0
-
-    for stem_len in range(4, 16):
-        for loop_len in range(3, 11):
-            for i in range(n - 2 * stem_len - loop_len + 1):
-                stem5 = region[i:i + stem_len]
-                j = i + stem_len + loop_len
-                if j + stem_len > n:
-                    break
-                stem3 = region[j:j + stem_len]
-                complement = stem3[::-1]
-                valid = all(_is_complement(stem5[k], complement[k]) for k in range(stem_len))
-                if not valid:
-                    continue
-                dg = _stem_dg(stem5, complement)
-                if dg < best_dg:
-                    best_dg = dg
-                    loop = region[i + stem_len:j]
-                    best = {
-                        'dg': dg,
-                        'stem5_start': i,
-                        'stem5_end': i + stem_len,
-                        'stem3_start': j,
-                        'stem3_end': j + stem_len,
-                        'stem5_seq': stem5,
-                        'stem3_seq': stem3,
-                        'loop_seq': loop,
-                        'stem_len': stem_len,
-                        'loop_len': loop_len,
-                        'structure': (
-                            f"Stem: {stem5} / {stem3[::-1]} "
-                            f"(len={stem_len}), Loop: {loop} "
-                            f"(len={loop_len}), ΔG≈{dg:.1f} kcal/mol"
-                        ),
-                    }
-    return best
+    n = len(seq)
+    for arm_len in range(min_arm, n // 2 + 1):
+        for loop_len in range(min_loop, max_loop + 1):
+            total = 2 * arm_len + loop_len
+            if total > n:
+                break
+            for i in range(n - total + 1):
+                arm5 = seq[i:i + arm_len]
+                j = i + arm_len + loop_len
+                arm3 = seq[j:j + arm_len]
+                rc_arm5 = ''.join(_RC_MAP.get(b, 'N') for b in reversed(arm5))
+                if arm3 == rc_arm5:
+                    loop = seq[i + arm_len:j]
+                    return True, (
+                        f"Inverted repeat: 5' arm={arm5}, 3' arm={arm3} "
+                        f"(len={arm_len}), loop={loop} (len={loop_len}) at pos {i}"
+                    )
+    return False, ""
 
 
-def fiveprime_hairpin(sequence: str) -> dict:
+def fiveprime_structure(sequence: str) -> dict:
     """
-    Check the first 48 bp for hairpin structures using a pure-Python stem-loop detector.
-    Note: ΔG estimated with simplified nearest-neighbor model. For precise values, use ViennaRNA.
+    Heuristic 5' structure check on the first 48 bp:
+      1. GC% must be in 30–70%.
+      2. No perfect inverted repeat with arm ≥ 8 bp and loop 3–10 nt.
     """
-    threshold_dg = -8.0
-    best = _find_worst_hairpin(sequence, max_region=48)
-    best_dg = best['dg'] if best else 0.0
-    best_structure = best['structure'] if best else None
+    seq = sequence.upper()
+    region = seq[:48]
+    issues = []
+    positions = []
 
-    passed = best_dg >= threshold_dg
-    if best_structure:
-        details = (
-            f"{'No problematic' if passed else 'Potential'} 5' hairpin detected. "
-            f"{best_structure}. "
-            "Note: ΔG estimated with simplified nearest-neighbor model. "
-            "For precise values, use ViennaRNA."
-        )
-    else:
-        details = (
-            "No hairpin structures detected in first 48 bp. "
-            "Note: ΔG estimated with simplified nearest-neighbor model. "
-            "For precise values, use ViennaRNA."
-        )
+    gc = _gc_content(region) * 100
+    if gc < 30.0 or gc > 70.0:
+        issues.append(f"5' GC% = {gc:.1f}% (outside 30–70%)")
+        positions.append(0)
 
-    positions = [0] if not passed else []
-    return {"name": "fiveprime_hairpin", "passed": passed, "details": details,
+    found, desc = _has_inverted_repeat(region)
+    if found:
+        issues.append(desc)
+        positions.append(0)
+
+    passed = len(issues) == 0
+    details = (
+        "5' region (48 bp): GC% in range and no inverted repeats detected"
+        if passed
+        else "; ".join(issues)
+    )
+    return {"name": "fiveprime_structure", "passed": passed, "details": details,
             "positions": positions}
 
 
@@ -407,7 +339,7 @@ ALL_CHECKS = [
     global_gc,
     local_gc_windows,
     rare_codons,
-    fiveprime_hairpin,
+    fiveprime_structure,
 ]
 
 CHECK_GROUPS = {
@@ -426,7 +358,7 @@ CHECK_GROUPS = {
     ],
     "Expression Quality": [
         "rare_codons",
-        "fiveprime_hairpin",
+        "fiveprime_structure",
     ],
 }
 
@@ -439,8 +371,6 @@ def run_all_checks(sequence: str, options: dict | None = None) -> list[dict]:
     results = []
     for check_fn in ALL_CHECKS:
         name = check_fn.__name__
-        if name == "fiveprime_hairpin" and not options.get("check_hairpin", True):
-            continue
         if name == "repeat_sequences" and not options.get("check_repeats", True):
             continue
         try:

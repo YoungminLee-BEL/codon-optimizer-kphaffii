@@ -732,7 +732,7 @@ function renderResults(data) {
 const CHECK_GROUPS = {
   'ORF & Expression Signals': ['orf_integrity','internal_initiation','cryptic_promoter','strong_rbs','terminator_sequences'],
   'Manufacturability': ['repeat_sequences','homopolymer_runs','global_gc','local_gc_windows'],
-  'Expression Quality': ['rare_codons','fiveprime_hairpin'],
+  'Expression Quality': ['rare_codons','fiveprime_structure'],
 };
 
 const CHECK_LABELS = {
@@ -746,7 +746,7 @@ const CHECK_LABELS = {
   'global_gc': 'Global GC Content',
   'local_gc_windows': 'Local GC Windows',
   'rare_codons': 'Rare Codons',
-  'fiveprime_hairpin': "5' Hairpin",
+  'fiveprime_structure': "5' Structure Check",
 };
 
 function renderChecks(checks) {

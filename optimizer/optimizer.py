@@ -9,9 +9,6 @@ Pipeline:
 """
 
 import re
-import math
-import itertools
-import sys
 from typing import Optional
 
 from .codon_table import (
@@ -27,16 +24,11 @@ from .checkers import (
     terminator_sequences as chk_terminator,
     homopolymer_runs as chk_homopolymer,
     repeat_sequences as chk_repeat,
-    fiveprime_hairpin as chk_hairpin,
+    fiveprime_structure as chk_fiveprime_structure,
     rare_codons as chk_rare_codons,
     _reverse_complement,
-    _find_worst_hairpin,
 )
 from .cai import calculate_cai
-
-def _dbg(msg: str) -> None:
-    """Write a debug line to stderr (visible in console, not in web UI)."""
-    print(f"[hairpin-fix] {msg}", file=sys.stderr)
 
 # ---------------------------------------------------------------------------
 # Input parsing / validation
@@ -716,221 +708,52 @@ def fix_repeat_sequences(
 
 
 # ---------------------------------------------------------------------------
-# Fixer: 5' hairpin — aggressive combinatorial multi-codon swap
+# Fixer: 5' structure (GC% + inverted repeat heuristic)
 # ---------------------------------------------------------------------------
 
-def _codon_cai_weight(codon: str) -> float:
-    """Return the CAI weight w_i for a single codon (0..1)."""
-    from .cai import _MAX_FREQ
-    aa = GENETIC_CODE.get(codon)
-    if not aa or aa in ('M', 'W', '*'):
-        return 1.0  # excluded from CAI, neutral
-    freq = CODON_USAGE.get(codon, 0.0)
-    max_freq = _MAX_FREQ.get(aa, 1.0)
-    return freq / max_freq if max_freq > 0 else 0.0
-
-
-def _best_hairpin_in_seq(seq: str, max_region: int) -> tuple[float, dict | None]:
-    """Return (best_dg, hairpin_dict_or_None) for up to max_region bp."""
-    h = _find_worst_hairpin(seq, max_region=max_region)
-    return (h['dg'] if h else 0.0, h)
-
-
-def fix_fiveprime_hairpin(
+def fix_fiveprime_structure(
     codons: list[str],
     aa_sequence: str,
     changes: list[dict],
 ) -> tuple[list[str], list[str]]:
     """
-    Aggressively resolve 5' hairpin structures via combinatorial synonymous codon swaps.
+    Fix 5' structure violations (GC% out of 30–70% or perfect inverted repeat ≥ 8 bp)
+    via synonymous codon swaps in the first 16 codons.
 
-    Strategy (in order):
-      1. Identify stem arm positions in the first 48 bp from structured hairpin data.
-      2. Collect ALL codons overlapping either arm (first 16 codons, skip pos 0 = ATG).
-      3. Try all k-codon simultaneous swaps for k = 1, 2, 3; accept the best combination
-         (passes threshold AND maximises combined CAI weight).
-      4. If still failing: expand search to first 20 codons (60 bp window) and repeat k=1..3.
-      5. Marginal pass: if best achievable ΔG is in [−10, −8), accept with warning.
-      6. If ΔG < −10 and truly unresolvable, log detailed warning.
-
-    Debug output is written to stderr (console only, not shown in web UI).
+    Max 30 swap attempts total — fast, non-blocking, no combinatorial search.
     Returns (new_codons, list_of_unresolved_warnings).
     """
-    THRESHOLD = -8.0
-    MARGINAL = -10.0
-    reason = "fix: fiveprime_hairpin"
     unresolved: list[str] = []
+    reason = "fix: fiveprime_structure"
+    MAX_ATTEMPTS = 30
+    max_codon = min(16, len(codons))
 
-    def _apply_combo(base_codons, idx_alt_pairs):
-        """Apply a list of (codon_idx, alt_codon) and return the new codon list."""
-        test = base_codons[:]
-        for idx, alt in idx_alt_pairs:
+    seq = _codons_to_seq(codons)
+    if chk_fiveprime_structure(seq)['passed']:
+        return codons, unresolved
+
+    attempts = 0
+    for idx in range(1, max_codon):  # skip ATG at index 0
+        for alt in _synonyms_by_freq(codons[idx]):
+            if attempts >= MAX_ATTEMPTS:
+                break
+            test = codons[:]
             test[idx] = alt
-        return test
+            attempts += 1
+            if chk_fiveprime_structure(_codons_to_seq(test))['passed']:
+                _record_change(changes, idx, alt, reason)
+                return test, unresolved
+        if attempts >= MAX_ATTEMPTS:
+            break
 
-    def _combo_cai_score(base_codons, idx_alt_pairs):
-        """Sum of ln(w) improvement for swapped positions (higher = better CAI)."""
-        score = 0.0
-        for idx, alt in idx_alt_pairs:
-            score += math.log(max(_codon_cai_weight(alt), 1e-10))
-        return score
-
-    def _stem_codon_indices(hairpin: dict, max_codon: int) -> list[int]:
-        """
-        Return sorted list of unique codon indices that overlap either stem arm,
-        within [1, max_codon) (index 0 = ATG is always skipped).
-        """
-        idx_set: set[int] = set()
-        for start, end in [
-            (hairpin['stem5_start'], hairpin['stem5_end']),
-            (hairpin['stem3_start'], hairpin['stem3_end']),
-        ]:
-            for nt_pos in range(start, min(end, max_codon * 3)):
-                ci = nt_pos // 3
-                if 1 <= ci < max_codon:
-                    idx_set.add(ci)
-        return sorted(idx_set)
-
-    def _search(codons_in: list[str], max_codon: int, max_region: int) -> tuple[list[str], float]:
-        """
-        Try k=1,2,3 combinatorial swaps among the stem-overlapping codons.
-        Returns (best_codons, best_dg_achieved).
-        """
-        seq = _codons_to_seq(codons_in)
-        dg, hairpin = _best_hairpin_in_seq(seq, max_region)
-        if dg >= THRESHOLD or hairpin is None:
-            return codons_in, dg
-
-        stem_indices = _stem_codon_indices(hairpin, max_codon)
-        _dbg(f"Stem at nt [{hairpin['stem5_start']}-{hairpin['stem5_end']}] / "
-             f"[{hairpin['stem3_start']}-{hairpin['stem3_end']}], "
-             f"ΔG={dg:.1f}, targeting codons {stem_indices} (max_codon={max_codon})")
-
-        # Build synonym map for candidate indices
-        # Also include adjacent codons (±1) to widen the net
-        extended: set[int] = set(stem_indices)
-        for ci in stem_indices:
-            if ci > 1:
-                extended.add(ci - 1)
-            if ci + 1 < max_codon:
-                extended.add(ci + 1)
-        candidate_indices = sorted(
-            i for i in extended if 0 < i < max_codon and _synonyms_by_freq(codons_in[i])
-        )
-        _dbg(f"Extended candidate codon indices: {candidate_indices}")
-
-        best_codons = codons_in
-        best_dg = dg
-        best_score = -1e9  # CAI score for tie-breaking
-
-        for k in range(1, 4):  # k = 1, 2, 3 simultaneous swaps
-            tried = 0
-            for combo_indices in itertools.combinations(candidate_indices, k):
-                alt_lists = [_synonyms_by_freq(codons_in[ci]) for ci in combo_indices]
-                for alt_combo in itertools.product(*alt_lists):
-                    tried += 1
-                    pairs = list(zip(combo_indices, alt_combo))
-                    test = _apply_combo(codons_in, pairs)
-                    test_seq = _codons_to_seq(test)
-                    new_dg, _ = _best_hairpin_in_seq(test_seq, max_region)
-                    cai_score = _combo_cai_score(codons_in, pairs)
-
-                    _dbg(
-                        f"  k={k} combo={combo_indices} alts={alt_combo} "
-                        f"→ ΔG={new_dg:.2f} CAI_score={cai_score:.3f}"
-                    )
-
-                    if new_dg >= THRESHOLD:
-                        # Passes hard threshold — prefer highest CAI among passing combos
-                        if new_dg > best_dg or (new_dg >= THRESHOLD and cai_score > best_score):
-                            best_dg = new_dg
-                            best_score = cai_score
-                            best_codons = test
-                            _dbg(f"  *** New best: ΔG={new_dg:.2f}, "
-                                 f"combo={combo_indices}→{alt_combo}")
-                    elif new_dg > best_dg:
-                        # Doesn't pass threshold but reduces severity — track as fallback
-                        if best_dg < THRESHOLD:
-                            best_dg = new_dg
-                            best_score = cai_score
-                            best_codons = test
-
-            _dbg(f"k={k}: tried {tried} combinations, best ΔG so far={best_dg:.2f}")
-            if best_dg >= THRESHOLD:
-                break  # Found a passing solution at this k — no need for larger k
-
-        return best_codons, best_dg
-
-    # ---- Phase 1: first 16 codons / 48 bp ----
+    # Still failing after max attempts
     seq = _codons_to_seq(codons)
-    dg0, h0 = _best_hairpin_in_seq(seq, max_region=48)
-
-    if dg0 >= THRESHOLD or h0 is None:
-        _dbg("No hairpin violation detected — nothing to fix.")
-        return codons, unresolved
-
-    _dbg(f"Phase 1 start: {h0['structure']}")
-    codons, achieved_dg = _search(codons, max_codon=min(16, len(codons)), max_region=48)
-
-    if achieved_dg >= THRESHOLD:
-        _dbg(f"Phase 1 success: ΔG={achieved_dg:.2f}")
-        # Record all changes vs original
-        for i, (orig_c, new_c) in enumerate(zip(
-            [get_best_codon(aa) for aa in aa_sequence], codons
-        )):
-            if orig_c != new_c and i < len(changes):
-                _record_change(changes, i, new_c, reason)
-        return codons, unresolved
-
-    # ---- Phase 2: expand to first 20 codons / 60 bp ----
-    _dbg(f"Phase 1 failed (best ΔG={achieved_dg:.2f}). "
-         f"Expanding to 20 codons / 60 bp window.")
-    codons, achieved_dg = _search(codons, max_codon=min(20, len(codons)), max_region=60)
-
-    if achieved_dg >= THRESHOLD:
-        _dbg(f"Phase 2 success: ΔG={achieved_dg:.2f}")
-        for i, (orig_c, new_c) in enumerate(zip(
-            [get_best_codon(aa) for aa in aa_sequence], codons
-        )):
-            if orig_c != new_c and i < len(changes):
-                _record_change(changes, i, new_c, reason)
-        return codons, unresolved
-
-    # ---- Phase 3: marginal pass or hard failure ----
-    seq = _codons_to_seq(codons)
-    final_dg, final_h = _best_hairpin_in_seq(seq, max_region=60)
-
-    if MARGINAL <= final_dg < THRESHOLD:
-        # Marginal — accept with warning
-        warn = (
-            f"fiveprime_hairpin: marginal hairpin remaining (ΔG={final_dg:.1f} kcal/mol, "
-            f"threshold={THRESHOLD}). {final_h['structure'] if final_h else ''}. "
-            "Best available codon set applied. "
-            "Note: ΔG estimated with simplified nearest-neighbor model; "
-            "consider ViennaRNA for precise assessment."
+    result = chk_fiveprime_structure(seq)
+    if not result['passed']:
+        unresolved.append(
+            f"fiveprime_structure: could not resolve 5' structure issue "
+            f"within {MAX_ATTEMPTS} attempts — {result['details']}"
         )
-        _dbg(f"Marginal pass: {warn}")
-        unresolved.append(warn)
-        for i, (orig_c, new_c) in enumerate(zip(
-            [get_best_codon(aa) for aa in aa_sequence], codons
-        )):
-            if orig_c != new_c and i < len(changes):
-                _record_change(changes, i, new_c, reason)
-    else:
-        # Hard failure
-        struct_desc = final_h['structure'] if final_h else "unknown structure"
-        warn = (
-            f"fiveprime_hairpin: unresolvable hairpin (ΔG={final_dg:.1f} kcal/mol). "
-            f"{struct_desc}. "
-            "All combinations of up to 3 synonymous codon swaps within the first 20 codons "
-            "were tried without success. The amino acid sequence constrains the 5' region "
-            "such that no synonymous alternative eliminates the stem structure. "
-            "Note: ΔG estimated with simplified nearest-neighbor model. "
-            "For precise values and manual redesign, use ViennaRNA."
-        )
-        _dbg(f"Hard failure: {warn}")
-        unresolved.append(warn)
-
     return codons, unresolved
 
 
@@ -991,14 +814,14 @@ def _build_greedy_sequence(protein: str) -> tuple[list[str], list[dict]]:
 
 # Ordered list of (fixer_fn, options_key_or_None, violation_name)
 _FIXERS = [
-    (fix_strong_rbs,            None,                'strong_rbs'),
-    (fix_cryptic_promoter,      None,                'cryptic_promoter'),
-    (fix_internal_initiation,   None,                'internal_initiation'),
-    (fix_terminator_sequences,  None,                'terminator_sequences'),
-    (fix_homopolymer_runs,      None,                'homopolymer_runs'),
-    (fix_repeat_sequences,      None,                'repeat_sequences'),
-    (fix_fiveprime_hairpin,     None,                'fiveprime_hairpin'),
-    (fix_rare_codons,           'avoid_rare_codons', 'rare_codons'),
+    (fix_strong_rbs,             None,                'strong_rbs'),
+    (fix_cryptic_promoter,       None,                'cryptic_promoter'),
+    (fix_internal_initiation,    None,                'internal_initiation'),
+    (fix_terminator_sequences,   None,                'terminator_sequences'),
+    (fix_homopolymer_runs,       None,                'homopolymer_runs'),
+    (fix_repeat_sequences,       None,                'repeat_sequences'),
+    (fix_fiveprime_structure,    None,                'fiveprime_structure'),
+    (fix_rare_codons,            'avoid_rare_codons', 'rare_codons'),
 ]
 
 
@@ -1056,7 +879,7 @@ def optimize(
 
     for full_pass in range(5):
         seq = _codons_to_seq(codons) + stop_codon
-        check_results_before = run_all_checks(seq, {'check_hairpin': True, 'check_repeats': True})
+        check_results_before = run_all_checks(seq, {'check_repeats': True})
         violations_before = {c['name'] for c in check_results_before if not c['passed']}
 
         if not violations_before:
@@ -1074,7 +897,7 @@ def optimize(
 
         seq_after = _codons_to_seq(codons) + stop_codon
         check_results_after = run_all_checks(
-            seq_after, {'check_hairpin': True, 'check_repeats': True}
+            seq_after, {'check_repeats': True}
         )
         violations_after = {c['name'] for c in check_results_after if not c['passed']}
 
@@ -1103,7 +926,7 @@ def optimize(
     cai_result = calculate_cai(final_cds)
 
     # 7. Final checks (always run all checks for reporting)
-    check_results = run_all_checks(final_cds, {'check_hairpin': True, 'check_repeats': True})
+    check_results = run_all_checks(final_cds, {'check_repeats': True})
 
     # 8. Codon changes report (only actual changes vs greedy original)
     codon_changes = []
